@@ -1,0 +1,784 @@
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index a2c2745..a4d8d3f 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -32,6 +32,7 @@
+ #include "postgres.h"
+ 
+ #include "access/bufmask.h"
++#include "access/zeno_wal_rpc.h"
+ #include "access/genam.h"
+ #include "access/heapam.h"
+ #include "access/heapam_xlog.h"
+@@ -2254,6 +2255,9 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
+ 
+ 	END_CRIT_SECTION();
+ 
++	if (RelationNeedsWAL(relation))
++		ZenoWalAppendTuple(relation, heaptup);
++
+ 	UnlockReleaseBuffer(buffer);
+ 	if (vmbuffer != InvalidBuffer)
+ 		ReleaseBuffer(vmbuffer);
+@@ -2602,6 +2606,12 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
+ 
+ 		END_CRIT_SECTION();
+ 
++		if (RelationNeedsWAL(relation))
++		{
++			for (i = 0; i < nthispage; i++)
++				ZenoWalAppendTuple(relation, heaptuples[ndone + i]);
++		}
++
+ 		/*
+ 		 * If we've frozen everything on the page, update the visibilitymap.
+ 		 * We're already holding pin on the vmbuffer.
+@@ -4106,6 +4116,9 @@ l2:
+ 		LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
+ 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+ 
++	if (RelationNeedsWAL(relation))
++		ZenoWalAppendTuple(relation, heaptup);
++
+ 	/*
+ 	 * Mark old tuple for invalidation from system caches at next command
+ 	 * boundary, and mark the new tuple for invalidation in case we abort. We
+diff --git a/src/backend/access/transam/Makefile b/src/backend/access/transam/Makefile
+index 595e02d..3fd6df9 100644
+--- a/src/backend/access/transam/Makefile
++++ b/src/backend/access/transam/Makefile
+@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
+ OBJS = \
+ 	clog.o \
+ 	commit_ts.o \
++	zeno_wal_rpc.o \
+ 	generic_xlog.o \
+ 	multixact.o \
+ 	parallel.o \
+diff --git a/src/backend/access/transam/zeno_wal_rpc.c b/src/backend/access/transam/zeno_wal_rpc.c
+new file mode 100644
+index 0000000..eefe7a8
+--- /dev/null
++++ b/src/backend/access/transam/zeno_wal_rpc.c
+@@ -0,0 +1,614 @@
++/*-------------------------------------------------------------------------
++ *
++ * zeno_wal_rpc.c
++ *		ZENO WAL payload RPC helpers.
++ *
++ * PostgreSQL sends RID batches to the ZENO TEE before writing the commit
++ * record.  The TEE returns encrypted ZENO WAL payloads, and PostgreSQL stores
++ * those payloads in its own WAL as logical messages.  Recovery consumption is
++ * intentionally left for a later prototype.
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include <fcntl.h>
++#include <stddef.h>
++#include <sys/mman.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++#include "access/zeno_wal_rpc.h"
++#include "access/htup_details.h"
++#include "catalog/catalog.h"
++#include "catalog/namespace.h"
++#include "miscadmin.h"
++#include "replication/message.h"
++#include "storage/ipc.h"
++#include "utils/memutils.h"
++#include "utils/rel.h"
++
++#define ZENO_SHM_NAME "/dev/shm/ipcshm"
++#define ZENO_SHM_SIZE (540 * 1024 * 1024)
++#ifndef TDX_SHM_PHYS_ADDR
++#define TDX_SHM_PHYS_ADDR UINT64CONST(0x2b8000000)
++#endif
++#define ZENO_META_REQ_SIZE 1024
++#define ZENO_REQ_REGION_SIZE (1024 * 1024)
++#define ZENO_REGION_N_OFFSET(n) (ZENO_META_REQ_SIZE + ZENO_REQ_REGION_SIZE * (n))
++#define ZENO_MAX_REGION_NUM ((ZENO_SHM_SIZE - ZENO_META_REQ_SIZE) / ZENO_REQ_REGION_SIZE)
++#define ZENO_BITMAP_BITS 64
++#define ZENO_BITMAP_SIZE ((ZENO_MAX_REGION_NUM + ZENO_BITMAP_BITS - 1) / ZENO_BITMAP_BITS)
++#define ZENO_BITMAP_WORD(n) ((n) / ZENO_BITMAP_BITS)
++#define ZENO_BITMAP_MASK(n) (UINT64CONST(1) << ((n) % ZENO_BITMAP_BITS))
++
++/* Keep these in sync with ZENO/src/include/defs.h. */
++#define ZENO_CMD_WAL_MATERIALIZE_BATCH 58
++#define ZENO_CMD_WAL_REPLAY_PAYLOAD 59
++#define ZENO_CMD_CKPT 60
++
++#define ZENO_ALLOC_TIMEOUT_US 10000000
++#define ZENO_REQ_TIMEOUT_US 10000000
++#define ZENO_WAL_RID_BATCH_SIZE 4096
++#define ZENO_WAL_MATERIALIZE_RID_BATCH_SIZE 3000
++#define ZENO_WAL_MESSAGE_PREFIX "zeno_wal"
++
++typedef enum ZenoShmReqStatus
++{
++	ZENO_SHM_NONE,
++	ZENO_SHM_GET,
++	ZENO_SHM_FREE,
++	ZENO_SHM_DONE,
++	ZENO_SHM_EXIT
++} ZenoShmReqStatus;
++
++typedef struct ZenoOpsReq
++{
++	volatile int lock;
++	int __res;
++	volatile ZenoShmReqStatus status;
++	int free_id;
++	int ret_id;
++	unsigned long long bitmap[ZENO_BITMAP_SIZE];
++} ZenoOpsReq;
++
++typedef enum ZenoReqStatus
++{
++	ZENO_REQ_NONE,
++	ZENO_REQ_SENT,
++	ZENO_REQ_DONE,
++	ZENO_REQ_EXIT
++} ZenoReqStatus;
++
++typedef struct ZenoBaseRequest
++{
++	volatile ZenoReqStatus status;
++	int reqType;
++	int resp;
++} ZenoBaseRequest;
++
++typedef struct ZenoWalRidItem
++{
++	int type;
++	uint64 rid;
++} ZenoWalRidItem;
++
++typedef struct ZenoWalMaterializeBatchRequest
++{
++	ZenoBaseRequest common;
++	int nitems;
++	uint64 payload_len;
++	ZenoWalRidItem items[ZENO_WAL_MATERIALIZE_RID_BATCH_SIZE];
++	unsigned char payload[FLEXIBLE_ARRAY_MEMBER];
++} ZenoWalMaterializeBatchRequest;
++
++typedef struct ZenoWalReplayPayloadRequest
++{
++	ZenoBaseRequest common;
++	uint64 payload_len;
++	unsigned char payload[FLEXIBLE_ARRAY_MEMBER];
++} ZenoWalReplayPayloadRequest;
++
++typedef struct ZenoWalPayloadChunk
++{
++	struct ZenoWalPayloadChunk *next;
++	Size len;
++	char data[FLEXIBLE_ARRAY_MEMBER];
++} ZenoWalPayloadChunk;
++
++static void *zeno_shm_addr = NULL;
++static void *zeno_req_buffer = NULL;
++static int zeno_shm_id = -1;
++static bool zeno_exit_registered = false;
++static bool zeno_shmem_exit_registered = false;
++static Oid zeno_kv_int4_oid = InvalidOid;
++static Oid zeno_kv_float4_oid = InvalidOid;
++static Oid zeno_kv_text_oid = InvalidOid;
++static Oid zeno_kv_timestamp_oid = InvalidOid;
++static bool zeno_loading_kv_type_oids = false;
++static ZenoWalRidItem *zeno_pending_items = NULL;
++static int zeno_pending_count = 0;
++static int zeno_pending_capacity = 0;
++static ZenoWalPayloadChunk *zeno_payload_head = NULL;
++static ZenoWalPayloadChunk *zeno_payload_tail = NULL;
++
++static bool
++ZenoWalDisabled(void)
++{
++	const char *disabled = getenv("ZENO_DISABLE_MAPPING_WAL");
++
++	return disabled != NULL && strcmp(disabled, "1") == 0;
++}
++
++static uint64
++ZenoNowUsec(void)
++{
++	struct timeval tv;
++
++	gettimeofday(&tv, NULL);
++	return (uint64) tv.tv_sec * UINT64CONST(1000000) + (uint64) tv.tv_usec;
++}
++
++static void
++ZenoCpuRelax(void)
++{
++#if defined(__x86_64__) || defined(__i386__)
++	__asm__ volatile("pause");
++#elif defined(__aarch64__)
++	__asm__ volatile("yield");
++#endif
++}
++
++static Size
++ZenoPayloadCapacity(void)
++{
++	return ZENO_REQ_REGION_SIZE - offsetof(ZenoWalMaterializeBatchRequest, payload);
++}
++
++static Size
++ZenoReplayPayloadCapacity(void)
++{
++	return ZENO_REQ_REGION_SIZE - offsetof(ZenoWalReplayPayloadRequest, payload);
++}
++
++static void
++ZenoEnsurePendingCapacity(int needed)
++{
++	int new_capacity;
++
++	if (zeno_pending_capacity >= needed)
++		return;
++
++	new_capacity = zeno_pending_capacity > 0 ? zeno_pending_capacity : ZENO_WAL_RID_BATCH_SIZE;
++	while (new_capacity < needed)
++		new_capacity *= 2;
++
++	if (zeno_pending_items == NULL)
++		zeno_pending_items = (ZenoWalRidItem *)
++			MemoryContextAlloc(TopMemoryContext, (Size) new_capacity * sizeof(ZenoWalRidItem));
++	else
++		zeno_pending_items = (ZenoWalRidItem *)
++			repalloc(zeno_pending_items, (Size) new_capacity * sizeof(ZenoWalRidItem));
++
++	zeno_pending_capacity = new_capacity;
++}
++
++static void
++ZenoClearPayloads(void)
++{
++	ZenoWalPayloadChunk *chunk = zeno_payload_head;
++
++	while (chunk != NULL)
++	{
++		ZenoWalPayloadChunk *next = chunk->next;
++		pfree(chunk);
++		chunk = next;
++	}
++	zeno_payload_head = NULL;
++	zeno_payload_tail = NULL;
++}
++
++static void
++ZenoSavePayload(const unsigned char *payload, Size len)
++{
++	ZenoWalPayloadChunk *chunk;
++
++	if (len == 0)
++		return;
++
++	chunk = (ZenoWalPayloadChunk *)
++		MemoryContextAlloc(TopMemoryContext, offsetof(ZenoWalPayloadChunk, data) + len);
++	chunk->next = NULL;
++	chunk->len = len;
++	memcpy(chunk->data, payload, len);
++
++	if (zeno_payload_tail == NULL)
++		zeno_payload_head = chunk;
++	else
++		zeno_payload_tail->next = chunk;
++	zeno_payload_tail = chunk;
++}
++
++static bool
++ZenoWaitForReqDone(ZenoBaseRequest *req, uint64 timeout_us)
++{
++	uint64 deadline;
++
++	deadline = ZenoNowUsec() + timeout_us;
++	while (req->status != ZENO_REQ_DONE)
++	{
++		if (ZenoNowUsec() >= deadline)
++			return false;
++		ZenoCpuRelax();
++	}
++	__sync_synchronize();
++	return true;
++}
++
++static bool
++ZenoMapSharedMemory(void)
++{
++	int fd;
++	void *addr;
++
++	if (zeno_shm_addr != NULL)
++		return true;
++
++#ifdef USE_TDX_FIXED_SHM
++	fd = open("/dev/mem", O_RDWR | O_SYNC);
++#else
++	fd = open(ZENO_SHM_NAME, O_RDWR);
++	if (fd < 0)
++		fd = open("/dev/uio0", O_RDWR);
++#endif
++	if (fd < 0)
++		return false;
++
++	addr = mmap(NULL, ZENO_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
++#ifdef USE_TDX_FIXED_SHM
++				(off_t) TDX_SHM_PHYS_ADDR
++#else
++				0
++#endif
++		);
++	close(fd);
++	if (addr == MAP_FAILED)
++		return false;
++
++	zeno_shm_addr = addr;
++	return true;
++}
++
++static bool
++ZenoAllocRequestBuffer(void)
++{
++	ZenoOpsReq *ops;
++	uint64 deadline;
++	int region_id;
++
++	if (zeno_req_buffer != NULL)
++		return true;
++	if (!ZenoMapSharedMemory())
++		return false;
++
++	ops = (ZenoOpsReq *) zeno_shm_addr;
++	deadline = ZenoNowUsec() + ZENO_ALLOC_TIMEOUT_US;
++	while (true)
++	{
++		if (ops->status == ZENO_SHM_EXIT)
++			return false;
++		for (region_id = 0; region_id < ZENO_MAX_REGION_NUM; region_id++)
++		{
++			unsigned long long mask = ZENO_BITMAP_MASK(region_id);
++			unsigned long long *word = &ops->bitmap[ZENO_BITMAP_WORD(region_id)];
++			unsigned long long old;
++
++			while (true)
++			{
++				old = __atomic_load_n(word, __ATOMIC_RELAXED);
++				if ((old & mask) != 0)
++					break;
++				if (__sync_bool_compare_and_swap(word, old, old | mask))
++				{
++					zeno_shm_id = region_id;
++					zeno_req_buffer = (char *) zeno_shm_addr +
++						ZENO_REGION_N_OFFSET(region_id);
++					memset(zeno_req_buffer, 0, ZENO_REQ_REGION_SIZE);
++					__sync_synchronize();
++					return true;
++				}
++				ZenoCpuRelax();
++			}
++		}
++		if (ZenoNowUsec() >= deadline)
++			return false;
++		ZenoCpuRelax();
++	}
++}
++
++static void
++ZenoFreeRequestBuffer(void)
++{
++	ZenoOpsReq *ops;
++	ZenoBaseRequest *req;
++	unsigned long long mask;
++	unsigned long long old;
++
++	if (zeno_shm_addr == NULL || zeno_req_buffer == NULL || zeno_shm_id < 0)
++		return;
++
++	ops = (ZenoOpsReq *) zeno_shm_addr;
++	req = (ZenoBaseRequest *) zeno_req_buffer;
++	while (req->status == ZENO_REQ_SENT)
++		ZenoCpuRelax();
++	__sync_synchronize();
++	req->status = ZENO_REQ_NONE;
++	__sync_synchronize();
++
++	mask = ZENO_BITMAP_MASK(zeno_shm_id);
++	old = __sync_fetch_and_and(&ops->bitmap[ZENO_BITMAP_WORD(zeno_shm_id)], ~mask);
++	if ((old & mask) == 0)
++		elog(PANIC, "ZENO WAL RPC failed: freeing unallocated shared request buffer %d",
++			 zeno_shm_id);
++
++	zeno_req_buffer = NULL;
++	zeno_shm_id = -1;
++}
++
++static void
++ZenoReleaseRequestBuffer(void)
++{
++	if (zeno_req_buffer != NULL && zeno_shm_id >= 0)
++		ZenoFreeRequestBuffer();
++}
++
++static void
++ZenoWalRpcShmemExit(int code, Datum arg)
++{
++	ZenoReleaseRequestBuffer();
++}
++
++static void
++ZenoWalRpcProcExit(int code, Datum arg)
++{
++	ZenoReleaseRequestBuffer();
++	if (zeno_shm_addr != NULL)
++	{
++		munmap(zeno_shm_addr, ZENO_SHM_SIZE);
++		zeno_shm_addr = NULL;
++	}
++}
++
++static void
++ZenoEnsureRpcReady(void)
++{
++	if (ZenoPayloadCapacity() == 0)
++		elog(PANIC, "ZENO WAL RPC failed: materialize request exceeds region size %d",
++			 ZENO_REQ_REGION_SIZE);
++	if (!ZenoAllocRequestBuffer())
++		elog(PANIC, "ZENO WAL RPC failed: cannot allocate shared request buffer");
++	if (!zeno_shmem_exit_registered)
++	{
++		zeno_shmem_exit_registered = true;
++		before_shmem_exit(ZenoWalRpcShmemExit, 0);
++	}
++	if (!zeno_exit_registered)
++	{
++		zeno_exit_registered = true;
++		on_proc_exit(ZenoWalRpcProcExit, 0);
++	}
++}
++
++static void
++ZenoSendRequest(ZenoBaseRequest *req, const char *opname)
++{
++	if (req->status != ZENO_REQ_NONE)
++	{
++		ZenoReleaseRequestBuffer();
++		elog(PANIC, "ZENO WAL RPC failed: request buffer is busy");
++	}
++
++	__sync_synchronize();
++	req->status = ZENO_REQ_SENT;
++
++	if (!ZenoWaitForReqDone(req, ZENO_REQ_TIMEOUT_US))
++	{
++		req->status = ZENO_REQ_NONE;
++		ZenoReleaseRequestBuffer();
++		elog(PANIC, "ZENO WAL RPC failed: %s timed out", opname);
++	}
++
++	req->status = ZENO_REQ_NONE;
++}
++
++static void
++ZenoLoadKvTypeOids(void)
++{
++	if (zeno_loading_kv_type_oids)
++		return;
++
++	zeno_loading_kv_type_oids = true;
++	if (!OidIsValid(zeno_kv_int4_oid))
++		zeno_kv_int4_oid = TypenameGetTypid("kv_int4");
++	if (!OidIsValid(zeno_kv_float4_oid))
++		zeno_kv_float4_oid = TypenameGetTypid("kv_float4");
++	if (!OidIsValid(zeno_kv_text_oid))
++		zeno_kv_text_oid = TypenameGetTypid("kv_text");
++	if (!OidIsValid(zeno_kv_timestamp_oid))
++		zeno_kv_timestamp_oid = TypenameGetTypid("kv_timestamp");
++	zeno_loading_kv_type_oids = false;
++}
++
++static int
++ZenoWalTypeForOid(Oid typid)
++{
++	if (typid == zeno_kv_int4_oid)
++		return 0;
++	if (typid == zeno_kv_float4_oid)
++		return 1;
++	if (typid == zeno_kv_text_oid)
++		return 2;
++	if (typid == zeno_kv_timestamp_oid)
++		return 3;
++	return -1;
++}
++
++static void
++ZenoWalMaterializeBatch(ZenoWalRidItem *items, int nitems)
++{
++	ZenoWalMaterializeBatchRequest *req;
++
++	if (nitems == 0)
++		return;
++
++	ZenoEnsureRpcReady();
++	req = (ZenoWalMaterializeBatchRequest *) zeno_req_buffer;
++	req->common.reqType = ZENO_CMD_WAL_MATERIALIZE_BATCH;
++	req->common.resp = 0;
++	req->nitems = nitems;
++	req->payload_len = 0;
++	memcpy(req->items, items, nitems * sizeof(ZenoWalRidItem));
++
++	ZenoSendRequest(&req->common, "CMD_WAL_MATERIALIZE_BATCH");
++	if (req->payload_len == 0 || req->payload_len > ZenoPayloadCapacity())
++		elog(PANIC, "ZENO WAL RPC failed: invalid payload size %lu",
++			 (unsigned long) req->payload_len);
++	ZenoSavePayload(req->payload, (Size) req->payload_len);
++}
++
++static void
++ZenoWalMaterializeFullBatches(void)
++{
++	while (zeno_pending_count >= ZENO_WAL_MATERIALIZE_RID_BATCH_SIZE)
++	{
++		int remain = zeno_pending_count - ZENO_WAL_MATERIALIZE_RID_BATCH_SIZE;
++
++		ZenoWalMaterializeBatch(zeno_pending_items, ZENO_WAL_MATERIALIZE_RID_BATCH_SIZE);
++		if (remain > 0)
++			memmove(zeno_pending_items,
++					&zeno_pending_items[ZENO_WAL_MATERIALIZE_RID_BATCH_SIZE],
++					remain * sizeof(ZenoWalRidItem));
++		zeno_pending_count = remain;
++	}
++}
++
++void
++ZenoWalAppendTuple(Relation relation, HeapTuple tuple)
++{
++	TupleDesc desc;
++	ZenoWalRidItem items[ZENO_WAL_RID_BATCH_SIZE];
++	int i;
++	int nitems = 0;
++
++	if (ZenoWalDisabled())
++		return;
++	if (relation == NULL || tuple == NULL)
++		return;
++	if (IsCatalogRelation(relation))
++		return;
++
++	ZenoLoadKvTypeOids();
++	if (!OidIsValid(zeno_kv_int4_oid) || !OidIsValid(zeno_kv_float4_oid) ||
++		!OidIsValid(zeno_kv_text_oid) || !OidIsValid(zeno_kv_timestamp_oid))
++		return;
++
++	desc = RelationGetDescr(relation);
++	for (i = 0; i < desc->natts && nitems < ZENO_WAL_RID_BATCH_SIZE; i++)
++	{
++		Form_pg_attribute attr = TupleDescAttr(desc, i);
++		bool isnull;
++		Datum datum;
++		int type;
++
++		if (attr->attisdropped)
++			continue;
++		type = ZenoWalTypeForOid(attr->atttypid);
++		if (type < 0)
++			continue;
++
++		datum = heap_getattr(tuple, i + 1, desc, &isnull);
++		if (isnull)
++			continue;
++
++		items[nitems].type = type;
++		items[nitems].rid = DatumGetUInt64(datum);
++		nitems++;
++	}
++
++	if (nitems == 0)
++		return;
++
++	ZenoEnsurePendingCapacity(zeno_pending_count + nitems);
++	memcpy(&zeno_pending_items[zeno_pending_count], items, nitems * sizeof(ZenoWalRidItem));
++	zeno_pending_count += nitems;
++	ZenoWalMaterializeFullBatches();
++}
++
++void
++ZenoWalMaterializePending(void)
++{
++	if (ZenoWalDisabled())
++		return;
++	if (zeno_pending_count == 0)
++		return;
++
++	ZenoWalMaterializeBatch(zeno_pending_items, zeno_pending_count);
++	zeno_pending_count = 0;
++}
++
++void
++ZenoWalLogPendingPayloads(void)
++{
++	ZenoWalPayloadChunk *chunk;
++
++	if (ZenoWalDisabled())
++		return;
++	for (chunk = zeno_payload_head; chunk != NULL; chunk = chunk->next)
++		LogLogicalMessage(ZENO_WAL_MESSAGE_PREFIX, chunk->data, chunk->len, false);
++
++	ZenoClearPayloads();
++}
++
++void
++ZenoWalReplayPayload(const char *payload, Size len)
++{
++	ZenoWalReplayPayloadRequest *req;
++	const char *disabled;
++
++	if (ZenoWalDisabled())
++		return;
++	disabled = getenv("ZENO_DISABLE_MAPPING_WAL_RECOVERY");
++	if (disabled != NULL && strcmp(disabled, "1") == 0)
++		return;
++	if (payload == NULL || len == 0)
++		return;
++	if (len > ZenoReplayPayloadCapacity())
++		elog(PANIC, "ZENO WAL recovery payload too large: %lu capacity=%lu",
++			 (unsigned long) len, (unsigned long) ZenoReplayPayloadCapacity());
++
++	ZenoEnsureRpcReady();
++	req = (ZenoWalReplayPayloadRequest *) zeno_req_buffer;
++	req->common.reqType = ZENO_CMD_WAL_REPLAY_PAYLOAD;
++	req->common.resp = 0;
++	req->payload_len = len;
++	memcpy(req->payload, payload, len);
++
++	ZenoSendRequest(&req->common, "CMD_WAL_REPLAY_PAYLOAD");
++}
++
++void
++ZenoCheckpointSyncStart(void)
++{
++	ZenoBaseRequest *req;
++
++	if (ZenoWalDisabled())
++		return;
++
++	ZenoEnsureRpcReady();
++	req = (ZenoBaseRequest *) zeno_req_buffer;
++	req->reqType = ZENO_CMD_CKPT;
++	req->resp = 0;
++
++	ZenoSendRequest(req, "CMD_CKPT");
++}
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+index 395650d..c960a63 100644
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -21,6 +21,7 @@
+ #include <unistd.h>
+ 
+ #include "access/commit_ts.h"
++#include "access/zeno_wal_rpc.h"
+ #include "access/multixact.h"
+ #include "access/parallel.h"
+ #include "access/subtrans.h"
+@@ -1325,6 +1326,8 @@ RecordTransactionCommit(void)
+ 		/*
+ 		 * Begin commit critical section and insert the commit XLOG record.
+ 		 */
++		ZenoWalMaterializePending();
++
+ 		/* Tell bufmgr and smgr to prepare for commit */
+ 		BufmgrCommit();
+ 
+@@ -1351,6 +1354,8 @@ RecordTransactionCommit(void)
+ 
+ 		SetCurrentTransactionStopTimestamp();
+ 
++		ZenoWalLogPendingPayloads();
++
+ 		XactLogCommitRecord(xactStopTimestamp,
+ 							nchildren, children, nrels, rels,
+ 							nmsgs, invalMessages,
+diff --git a/src/backend/replication/logical/message.c b/src/backend/replication/logical/message.c
+index 93bd372..7849a73 100644
+--- a/src/backend/replication/logical/message.c
++++ b/src/backend/replication/logical/message.c
+@@ -31,6 +31,7 @@
+ 
+ #include "postgres.h"
+ 
++#include "access/zeno_wal_rpc.h"
+ #include "access/xact.h"
+ #include "miscadmin.h"
+ #include "nodes/execnodes.h"
+@@ -80,9 +81,21 @@ void
+ logicalmsg_redo(XLogReaderState *record)
+ {
+ 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
++	xl_logical_message *xlrec;
++	char	   *prefix;
++	char	   *payload;
+ 
+ 	if (info != XLOG_LOGICAL_MESSAGE)
+ 		elog(PANIC, "logicalmsg_redo: unknown op code %u", info);
+ 
+-	/* This is only interesting for logical decoding, see decode.c. */
++	xlrec = (xl_logical_message *) XLogRecGetData(record);
++	if (xlrec->prefix_size == 0)
++		return;
++
++	prefix = xlrec->message;
++	payload = xlrec->message + xlrec->prefix_size;
++	if (strcmp(prefix, "zeno_wal") == 0)
++		ZenoWalReplayPayload(payload, xlrec->message_size);
++
++	/* Other messages are only interesting for logical decoding, see decode.c. */
+ }
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index f89a57d..7b08af2 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -44,6 +44,7 @@
+ #include "access/clog.h"
+ #include "access/commit_ts.h"
+ #include "access/multixact.h"
++#include "access/zeno_wal_rpc.h"
+ #include "access/rewriteheap.h"
+ #include "access/subtrans.h"
+ #include "access/timeline.h"
+@@ -9415,1 +9416,2 @@ CreateCheckPoint(int flags)
+ 	CheckPointGuts(checkPoint.redo, flags);
++	ZenoCheckpointSyncStart();
+
+diff --git a/src/include/access/zeno_wal_rpc.h b/src/include/access/zeno_wal_rpc.h
+new file mode 100644
+index 0000000..8ef1531
+--- /dev/null
++++ b/src/include/access/zeno_wal_rpc.h
+@@ -0,0 +1,20 @@
++/*-------------------------------------------------------------------------
++ *
++ * zeno_wal_rpc.h
++ *		ZENO WAL payload RPC helpers.
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef ZENO_WAL_RPC_H
++#define ZENO_WAL_RPC_H
++
++#include "access/htup.h"
++#include "utils/relcache.h"
++
++extern void ZenoWalAppendTuple(Relation relation, HeapTuple tuple);
++extern void ZenoWalMaterializePending(void);
++extern void ZenoWalLogPendingPayloads(void);
++extern void ZenoWalReplayPayload(const char *payload, Size len);
++extern void ZenoCheckpointSyncStart(void);
++
++#endif
